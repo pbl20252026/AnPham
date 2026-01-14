@@ -7,7 +7,7 @@ import time
 # Cấu hình ngưỡng và thời gian
 
 # Ngưỡng khoảng cách cho click trái (nhạy hơn để bắt double click)
-nguong_left = 20
+nguong_left = 23
 nguong_right = 30
 
 # Thời gian tối đa giữa 2 lần click để được xem là double click
