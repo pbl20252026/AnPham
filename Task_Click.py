@@ -4,145 +4,221 @@ import math
 import time
 
 
-# CẤU HÌNH THAM SỐ NHẬN DẠNG
-nguong_cham = 35          # Ngưỡng khoảng cách (pixel) để coi là "chạm"
-delay = 0.1             # Thời gian chờ giữa 2 lần click (giây)
+# ================= config =================
 
-last_left_time = 0            # Lưu thời điểm click trái gần nhất
-last_right_time = 0           # Lưu thời điểm click phải gần nhất
+# Ngưỡng khoảng cách cho click trái (nhạy hơn để bắt double click)
+nguong_left = 20
+nguong_right = 30
+
+# Thời gian tối đa giữa 2 lần click để được xem là double click
+time_doubleclick = 0.25
+max_press_time = 0.35
+hold_timeout = 3.0
+none_debounce = 0.3
 
 
-# KHỞI TẠO MEDIAPIPE HANDS
+# ================= fsm state =================
+
+state_idle = "idle"
+state_pressing = "pressing"
+state_wait_double = "wait_double"
+state_reset_lock = "reset_lock"
+
+state = state_idle
+
+active_button = None
+last_click_time = 0
+press_time = 0
+
+prev_touching = None
+last_output = None
+last_none_time = 0
+
+# cho phép emit waiting hay chưa (sau reset phải thoát ngưỡng)
+allow_waiting = True
+
+
+# ================= mediapipe =================
 
 mp_hands = mp.solutions.hands
-
 hands = mp_hands.Hands(
-    static_image_mode=False,    # Chế độ ảnh động hay video (False)
-    max_num_hands=1,              # Chỉ detect tối đa 1 bàn tay
-    min_detection_confidence=0.7,  # Độ tin cậy khi phát hiện tay
-    min_tracking_confidence=0.7   # Độ tin cậy khi theo dõi landmark
+    static_image_mode=False,
+    max_num_hands=1,
+    min_detection_confidence=0.7,
+    min_tracking_confidence=0.7
 )
-
-mp_draw = mp.solutions.drawing_utils   # Dùng để vẽ khung xương bàn tay
-
-
-# KHỞI TẠO CAMERA WEBCAM
-
-cap = cv2.VideoCapture(0)     # 0 = webcam mặc định
+mp_draw = mp.solutions.drawing_utils
+cap = cv2.VideoCapture(0)
 
 
-# HÀM TÍNH KHOẢNG CÁCH 2 ĐIỂM
+# ================= utils =================
 
 def distance(p1, p2):
-    # Công thức khoảng cách Euclid giữa 2 điểm (x1,y1) và (x2,y2)
     return math.hypot(p1[0] - p2[0], p1[1] - p2[1])
 
 
-# HÀM PHÁT HIỆN LEFT CLICK (NGÓN CÁI + NGÓN TRỎ)
-def left_click(landmarks, w, h):
-    global last_left_time
+def detect_touch(landmarks, w, h):
+    thumb = landmarks[4]
+    index_finger = landmarks[8]
+    middle = landmarks[12]
 
-    # Lấy landmark đầu ngón cái (id = 4)
-    thumb_tip = landmarks[4]
+    tx, ty = int(thumb.x * w), int(thumb.y * h)
+    ix, iy = int(index_finger.x * w), int(index_finger.y * h)
+    mx, my = int(middle.x * w), int(middle.y * h)
 
-    # Lấy landmark đầu ngón trỏ (id = 8)
-    index_finger_tip = landmarks[8]
+    d_left = distance((tx, ty), (ix, iy))
+    d_right = distance((tx, ty), (mx, my))
 
-    # Chuyển tọa độ chuẩn hóa (0–1) sang pixel thật
-    tx, ty = int(thumb_tip.x * w), int(thumb_tip.y * h)
-    ix, iy = int(index_finger_tip.x * w), int(index_finger_tip.y * h)
-
-    # Tính khoảng cách giữa 2 đầu ngón
-    dist = distance((tx, ty), (ix, iy))
-
-    # Lấy thời gian hiện tại
-    now = time.time()
-
-    # Nếu khoảng cách nhỏ hơn ngưỡng và đã qua thời gian delay
-    if dist < nguong_cham and now - last_left_time > delay:
-        last_left_time = now
-        return "LEFT_CLICK"
-
+    if d_left < nguong_left:
+        return "left"
+    if d_right < nguong_right:
+        return "right"
     return None
 
 
-# HÀM PHÁT HIỆN RIGHT CLICK (NGÓN CÁI + NGÓN GIỮA)
-def right_click(landmarks, w, h):
-    global last_right_time
+def emit(msg):
+    global last_output, last_none_time
 
-    # Lấy landmark đầu ngón cái (id = 4)
-    thumb_tip = landmarks[4]
-
-    # Lấy landmark đầu ngón giữa (id = 12)
-    middle_tip = landmarks[12]
-
-    # Chuyển tọa độ chuẩn hóa sang pixel
-    tx, ty = int(thumb_tip.x * w), int(thumb_tip.y * h)
-    mx, my = int(middle_tip.x * w), int(middle_tip.y * h)
-
-    # Tính khoảng cách giữa 2 đầu ngón
-    dist = distance((tx, ty), (mx, my))
-
-    # Lấy thời gian hiện tại
     now = time.time()
 
-    # Điều kiện phát hiện click phải
-    if dist < nguong_cham and now - last_right_time > delay:
-        last_right_time = now
-        return "RIGHT_CLICK"
+    # debounce cho none
+    if msg.lower() == "none":
+        if now - last_none_time < none_debounce:
+            return
+        last_none_time = now
 
-    return None
+    # format output
+    format_map = {
+        "waiting": "Waiting",
+        "none": "None",
+        "reset": "Reset",
+    }
+
+    output = format_map.get(msg, msg)
+
+    if output != last_output:
+        print(output)
+        last_output = output
 
 
-# VÒNG LẶP XỬ LÝ CAMERA
+def reset_fsm(lock_waiting=True):
+    global state, active_button, press_time, allow_waiting
+    state = state_idle
+    active_button = None
+    press_time = 0
+
+    # reset do timeout → khóa waiting cho tới khi thoát ngưỡng
+    if lock_waiting:
+        allow_waiting = False
+    else:
+        allow_waiting = True
+
+
+# ================= main loop =================
+
 while True:
-
-    # Đọc 1 frame từ webcam
     success, frame = cap.read()
     if not success:
         continue
 
-    # Lật ảnh để giống gương
     frame = cv2.flip(frame, 1)
-
-    # Chuyển BGR -> RGB cho MediaPipe
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-    # MediaPipe xử lý và tìm landmark bàn tay
     results = hands.process(rgb)
 
-    # Lấy kích thước ảnh
     h, w, _ = frame.shape
+    now = time.time()
 
-    # Nếu phát hiện có bàn tay
+    touching = None
+    hand_detected = False
+
     if results.multi_hand_landmarks:
+        hand_detected = True
         for hand in results.multi_hand_landmarks:
-
-            # Vẽ skeleton bàn tay lên màn hình
             mp_draw.draw_landmarks(frame, hand, mp_hands.HAND_CONNECTIONS)
+            touching = detect_touch(hand.landmark, w, h)
 
-            # Gọi hàm kiểm tra left click
-            label_left = left_click(hand.landmark, w, h)
+    # -------- edge detect --------
+    just_pressed = touching and not prev_touching
+    just_released = not touching and prev_touching
+    prev_touching = touching
 
-            # Gọi hàm kiểm tra right click
-            label_right = right_click(hand.landmark, w, h)
+    # ================= fsm =================
 
-            # In kết quả ra terminal để test
-            if label_left:
-                print(label_left)
+    # -------- idle --------
+    if state == state_idle:
 
-            if label_right:
-                print(label_right)
+        # có thao tác chạm hợp lệ
+        if just_pressed and touching in ("left", "right"):
+            state = state_pressing
+            active_button = touching
+            press_time = now
+            emit(f"mouseDown {active_button.capitalize()}")
 
-    # Hiển thị cửa sổ camera
-    cv2.imshow("Gesture Detection Only", frame)
+        # có tay nhưng không có thao tác hợp lệ
+        elif hand_detected and touching is None and allow_waiting:
+            emit("waiting")
 
-    # Nhấn ESC để thoát
+        # không có tay trong camera
+        elif not hand_detected:
+            emit("none")
+
+    # -------- pressing --------
+    elif state == state_pressing:
+
+        # giữ quá lâu → reset
+        if now - press_time > hold_timeout:
+            emit("reset")
+            state = state_reset_lock
+            allow_waiting = False
+
+        # nhả tay
+        elif just_released:
+            press_duration = now - press_time
+
+            # right hoặc giữ lâu → single click
+            if active_button == "right" or press_duration > max_press_time:
+                emit(
+                    "mouseUp rightClick" if active_button == "right"
+                    else "mouseUp leftClick"
+                )
+                reset_fsm(lock_waiting=False)
+                emit("waiting")
+
+            # left ngắn → chờ double click
+            else:
+                state = state_wait_double
+                last_click_time = now
+
+    # -------- wait double --------
+    elif state == state_wait_double:
+
+        # click lần 2 (không cần mouseUp)
+        if just_pressed and touching == "left":
+            if now - last_click_time <= time_doubleclick:
+                emit("mouseUp doubleClick")
+                reset_fsm(lock_waiting=False)
+                emit("waiting")
+
+        # hết thời gian → single click
+        elif now - last_click_time > time_doubleclick:
+            emit("mouseUp leftClick")
+            reset_fsm(lock_waiting=False)
+            emit("waiting")
+
+    # -------- reset lock --------
+    elif state == state_reset_lock:
+
+        # chỉ khi tay thoát hoàn toàn khỏi ngưỡng
+        if touching is None:
+            allow_waiting = True
+            reset_fsm(lock_waiting=False)
+
+    # ================= display =================
+
+    cv2.imshow("Click", frame)
     if cv2.waitKey(1) & 0xFF == 27:
         break
 
-
-# GIẢI PHÓNG TÀI NGUYÊN
 
 cap.release()
 cv2.destroyAllWindows()
