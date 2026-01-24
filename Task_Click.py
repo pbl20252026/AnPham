@@ -1,243 +1,193 @@
 import cv2
 import mediapipe as mp
-import math
 import time
+import math
+import numpy as np
+import pyautogui
+from pynput.mouse import Controller, Button
 
+# ========== CONFIG ==========
+# Ngưỡng kích hoạt chụm ngón tay
+nguong_cham_left = 30
+nguong_cham_right = 30
 
-# Cấu hình ngưỡng và thời gian
+# Cấu hình chuột & Màn hình
+smooth_factor = 5       # Độ mượt
+frame_reduction = 100   # Bo viền camera
+screen_w, screen_h = pyautogui.size()
 
-# Ngưỡng khoảng cách cho click trái (nhạy hơn để bắt double click)
-nguong_left = 23
-nguong_right = 30
+# Cấu hình Logic nâng cao
+# Giới hạn thời gian click trái (để phân biệt drag)
+max_click_duration_left = 0.3
+# (QUAN TRỌNG) Biên độ rung: Di chuyển quá 20px mới tính là Hover
+hover_threshold = 20
 
-# Thời gian tối đa giữa 2 lần click để được xem là double click
-time_doubleclick = 0.25
-max_press_time = 0.35
-hold_timeout = 3.0
-none_debounce = 0.3
-
-
-# Các trạng thái của máy trạng thái hữu hạn (FSM)
-
-state_idle = "idle"                 # Không có thao tác
-state_pressing = "pressing"         # Đang nhấn
-state_wait_double = "wait_double"   # Chờ click lần 2
-state_reset_lock = "reset_lock"     # Khóa sau reset
-
-state = state_idle                 # Trạng thái hiện tại
-
-active_button = None               # Nút đang được nhấn (left / right)
-# Thời điểm click lần đầu (dùng cho double click)
-last_click_time = 0
-press_time = 0                     # Thời điểm bắt đầu nhấn
-
-prev_touching = None               # Trạng thái touching của frame trước
-last_output = None                 # Giá trị output đã in lần gần nhất
-last_none_time = 0                 # Thời điểm in None gần nhất
-
-# Cho phép in Waiting hay chưa (sau reset phải thoát ngưỡng)
-allow_waiting = True
-
-
-# Khởi tạo Mediapipe và camera
-
+# ========== KHỞI TẠO ==========
+mouse = Controller()
 mp_hands = mp.solutions.hands
-hands = mp_hands.Hands(
-    static_image_mode=False,
-    max_num_hands=1,
-    min_detection_confidence=0.7,
-    min_tracking_confidence=0.7
-)
+hands = mp_hands.Hands(max_num_hands=1, min_detection_confidence=0.7)
 mp_draw = mp.solutions.drawing_utils
-cap = cv2.VideoCapture(0)
 
+# Biến toàn cục lưu trạng thái
+mouse_down_left = False
+start_time_left = 0
 
-# Hàm tính khoảng cách Euclid giữa hai điểm
+mouse_down_right = False
+start_pos_right = (0, 0)  # Lưu tọa độ lúc bắt đầu chụm phải
+is_right_hovering = False  # Cờ đánh dấu xem có phải đang hover không
+
+# Biến làm mượt tọa độ
+plocX, plocY = 0, 0
+clocX, clocY = 0, 0
+
 
 def distance(p1, p2):
     return math.hypot(p1[0] - p2[0], p1[1] - p2[1])
 
-
-# Hàm phát hiện ngón tay đang chạm để xác định left / right click
-
-def detect_touch(landmarks, w, h):
-    thumb = landmarks[4]           # Ngón cái
-    index_finger = landmarks[8]    # Ngón trỏ
-    middle = landmarks[12]         # Ngón giữa
-
-    # Quy đổi tọa độ chuẩn hóa sang pixel
-    tx, ty = int(thumb.x * w), int(thumb.y * h)
-    ix, iy = int(index_finger.x * w), int(index_finger.y * h)
-    mx, my = int(middle.x * w), int(middle.y * h)
-
-    # Tính khoảng cách giữa ngón cái và các ngón khác
-    d_left = distance((tx, ty), (ix, iy))
-    d_right = distance((tx, ty), (mx, my))
-
-    # Nếu nhỏ hơn ngưỡng thì xem là chạm
-    if d_left < nguong_left:
-        return "left"
-    if d_right < nguong_right:
-        return "right"
-
-    # Có tay nhưng không chạm
-    return None
+# ========== LOGIC XỬ LÝ ==========
 
 
-# Hàm in trạng thái ra console có chống spam
+def handle_gestures(x4, y4, x8, y8, x12, y12):
+    global mouse_down_left, start_time_left
+    global mouse_down_right, start_pos_right, is_right_hovering
 
-def emit(msg):
-    global last_output, last_none_time
+    # 1. TÍNH KHOẢNG CÁCH
+    dist_left = distance((x4, y4), (x8, y8))   # Cái - Trỏ
+    dist_right = distance((x4, y4), (x12, y12))  # Cái - Giữa
 
-    now = time.time()
-
-    # Chống spam khi in None liên tục
-    if msg.lower() == "none":
-        if now - last_none_time < none_debounce:
-            return
-        last_none_time = now
-
-    # Chuẩn hóa format hiển thị
-    format_map = {
-        "waiting": "Waiting",
-        "none": "None",
-        "reset": "Reset",
-    }
-
-    output = format_map.get(msg, msg)
-
-    # Chỉ in khi giá trị thay đổi
-    if output != last_output:
-        print(output)
-        last_output = output
-
-
-# Hàm reset toàn bộ trạng thái FSM
-
-def reset_fsm(lock_waiting=True):
-    global state, active_button, press_time, allow_waiting
-
-    state = state_idle
-    active_button = None
-    press_time = 0
-
-    # Nếu reset do timeout thì khóa waiting cho tới khi tay thoát hẳn
-    if lock_waiting:
-        allow_waiting = False
+    # ========================================================
+    # LOGIC LEFT CLICK (DRAG & DROP)
+    # ========================================================
+    if dist_left < nguong_cham_left:
+        if not mouse_down_left:
+            mouse_down_left = True
+            start_time_left = time.time()
+            mouse.press(Button.left)  # Giữ chuột trái để Drag
+            print("Left: DOWN (Drag Start)")
     else:
-        allow_waiting = True
+        if mouse_down_left:
+            mouse.release(Button.left)  # Nhả chuột (Drop)
+            mouse_down_left = False
+
+            # Logic click nhanh
+            if time.time() - start_time_left <= max_click_duration_left:
+                mouse.click(Button.left)
+                print("Left: Click (Fast Tap)")
+            else:
+                print("Left: Drop Finished")
+
+    # ========================================================
+    # LOGIC RIGHT CLICK (HOVER vs CLICK)
+    # ========================================================
+    if dist_right < nguong_cham_right:
+        # --- LÚC BẮT ĐẦU CHỤM PHẢI ---
+        if not mouse_down_right:
+            mouse_down_right = True
+            start_pos_right = (x4, y4)  # Lưu vị trí gốc
+            is_right_hovering = False  # Reset trạng thái hover
+            print("Right: Gesture Start (Waiting for move...)")
+
+        # --- TRONG LÚC ĐANG GIỮ ---
+        else:
+            # Kiểm tra xem đã di chuyển vượt quá "biên độ rung" chưa
+            dist_move = distance((x4, y4), start_pos_right)
+
+            if dist_move > hover_threshold:
+                if not is_right_hovering:
+                    is_right_hovering = True
+                    print(
+                        f"Right: HOVER MODE ACTIVATED (Moved {int(dist_move)}px)")
+
+                # Lưu ý: Ở chế độ này, ta KHÔNG press chuột phải
+                # Ta chỉ dùng gesture này để di chuyển con trỏ (xem phần map tọa độ dưới)
+
+    else:
+        # --- LÚC NHẢ TAY PHẢI ---
+        if mouse_down_right:
+            mouse_down_right = False
+
+            # Chỉ click nếu KHÔNG di chuyển nhiều (Hovering = False)
+            if not is_right_hovering:
+                mouse.click(Button.right)
+                print("Right: CLICK EXECUTED")
+            else:
+                print("Right: Hover Finished (No Click)")
 
 
-# Vòng lặp chính xử lý camera và logic
+# ========== CHƯƠNG TRÌNH CHÍNH ==========
+cap = cv2.VideoCapture(0)
 
 while True:
-    success, frame = cap.read()
-    if not success:
-        continue
-
-    # Lật ảnh cho giống gương
+    ret, frame = cap.read()
+    if not ret:
+        break
     frame = cv2.flip(frame, 1)
-
-    # Chuyển ảnh sang RGB cho Mediapipe
+    h, w, _ = frame.shape
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     results = hands.process(rgb)
 
-    h, w, _ = frame.shape
-    now = time.time()
-
-    touching = None
-    hand_detected = False
-
-    # Nếu phát hiện có tay
     if results.multi_hand_landmarks:
-        hand_detected = True
-        for hand in results.multi_hand_landmarks:
-            mp_draw.draw_landmarks(frame, hand, mp_hands.HAND_CONNECTIONS)
-            touching = detect_touch(hand.landmark, w, h)
+        for hand_landmarks in results.multi_hand_landmarks:
 
-    # Phát hiện cạnh nhấn và nhả (edge detection)
-    just_pressed = touching and not prev_touching
-    just_released = not touching and prev_touching
-    prev_touching = touching
+            # Lấy tọa độ pixel
+            lm4 = hand_landmarks.landmark[4]  # Cái
+            lm8 = hand_landmarks.landmark[8]  # Trỏ
+            lm12 = hand_landmarks.landmark[12]  # Giữa
 
-    # Trạng thái idle: chưa có thao tác
+            x4, y4 = int(lm4.x * w), int(lm4.y * h)
+            x8, y8 = int(lm8.x * w), int(lm8.y * h)
+            x12, y12 = int(lm12.x * w), int(lm12.y * h)
 
-    if state == state_idle:
+            # Gọi hàm xử lý logic cử chỉ
+            handle_gestures(x4, y4, x8, y8, x12, y12)
 
-        # Có thao tác chạm hợp lệ
-        if just_pressed and touching in ("left", "right"):
-            state = state_pressing
-            active_button = touching
-            press_time = now
-            emit(f"mouseDown {active_button.capitalize()}")
+            # ============================================================
+            # ĐIỀU HƯỚNG TỌA ĐỘ CHUỘT
+            # ============================================================
+            # Logic:
+            # 1. Nếu đang Drag Trái -> Dùng Ngón Cái
+            # 2. Nếu đang Giữ Phải (Hover/Click) -> Dùng Ngón Cái
+            # 3. Còn lại -> Dùng Ngón Trỏ
 
-        # Có tay nhưng không có thao tác hợp lệ
-        elif hand_detected and touching is None and allow_waiting:
-            emit("waiting")
-
-        # Không có tay trong camera
-        elif not hand_detected:
-            emit("none")
-
-    # Trạng thái pressing: đang nhấn
-
-    elif state == state_pressing:
-
-        # Nếu giữ quá lâu mà chưa nhả thì reset
-        if now - press_time > hold_timeout:
-            emit("reset")
-            state = state_reset_lock
-            allow_waiting = False
-
-        # Khi nhả tay
-        elif just_released:
-            press_duration = now - press_time
-
-            # Click phải hoặc giữ lâu → click đơn
-            if active_button == "right" or press_duration > max_press_time:
-                emit(
-                    "mouseUp rightClick" if active_button == "right"
-                    else "mouseUp leftClick"
-                )
-                reset_fsm(lock_waiting=False)
-                emit("waiting")
-
-            # Click trái ngắn → chuyển sang chờ double click
+            if mouse_down_left or mouse_down_right:
+                target_x, target_y = x4, y4
+                color_point = (0, 255, 0) if mouse_down_left else (
+                    0, 255, 255)  # Lục: Drag, Vàng: Right Hover
             else:
-                state = state_wait_double
-                last_click_time = now
+                target_x, target_y = x8, y8
+                color_point = (255, 0, 255)  # Tím: Normal Hover
 
-    # Trạng thái chờ double click
+            # Mapping tọa độ
+            screen_x = np.interp(
+                target_x, (frame_reduction, w - frame_reduction), (0, screen_w))
+            screen_y = np.interp(
+                target_y, (frame_reduction, h - frame_reduction), (0, screen_h))
 
-    elif state == state_wait_double:
+            # Smoothing
+            clocX = plocX + (screen_x - plocX) / smooth_factor
+            clocY = plocY + (screen_y - plocY) / smooth_factor
 
-        # Nếu click lần 2 trong thời gian cho phép
-        if just_pressed and touching == "left":
-            if now - last_click_time <= time_doubleclick:
-                emit("mouseUp doubleClick")
-                reset_fsm(lock_waiting=False)
-                emit("waiting")
+            # Di chuyển chuột
+            mouse.position = (clocX, clocY)
+            plocX, plocY = clocX, clocY
 
-        # Nếu hết thời gian chờ thì coi là click đơn
-        elif now - last_click_time > time_doubleclick:
-            emit("mouseUp leftClick")
-            reset_fsm(lock_waiting=False)
-            emit("waiting")
+            # Vẽ Visual
+            cv2.circle(frame, (target_x, target_y),
+                       15, color_point, cv2.FILLED)
 
-    # Trạng thái khóa sau reset
+            # Vẽ vòng tròn biên độ rung để debug (khi đang giữ chuột phải)
+            if mouse_down_right and not is_right_hovering:
+                cv2.circle(frame, start_pos_right,
+                           hover_threshold, (255, 255, 255), 1)
 
-    elif state == state_reset_lock:
+            cv2.rectangle(frame, (frame_reduction, frame_reduction),
+                          (w - frame_reduction, h - frame_reduction), (255, 0, 0), 2)
+            mp_draw.draw_landmarks(frame, hand_landmarks,
+                                   mp_hands.HAND_CONNECTIONS)
 
-        # Chỉ khi tay thoát hoàn toàn khỏi ngưỡng mới cho phép hoạt động lại
-        if touching is None:
-            allow_waiting = True
-            reset_fsm(lock_waiting=False)
-
-    # Hiển thị camera
-    cv2.imshow("Click", frame)
-    if cv2.waitKey(1) & 0xFF == 27:
+    cv2.imshow("Smart Hover & Drag", frame)
+    if cv2.waitKey(1) == 27:
         break
-
 
 cap.release()
 cv2.destroyAllWindows()
